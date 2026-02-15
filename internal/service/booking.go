@@ -13,7 +13,7 @@ import (
 // ─── Booking Errors ─────────────────────────────────────────
 
 var (
-	// ErrCabFull is returned when the cab has no remaining capacity.
+	// ErrCabFull is returned when the cab has no remaining seat or luggage capacity.
 	ErrCabFull = errors.New("cab is full: no remaining seats or luggage capacity")
 
 	// ErrBookingTimeout is returned when the transaction lock wait exceeds
@@ -128,8 +128,8 @@ func (s *BookingService) createNewTrip(ctx context.Context, requestID int64) (*n
 		return nil, fmt.Errorf("booking: fetch request: %w", err)
 	}
 
-	// Find nearest available cab (within 10km).
-	cab, err := s.bookingRepo.FindAvailableCabNear(ctx, req.Origin, 10000)
+	// Find nearest available cab (within 10km) that can fit this passenger's seats and luggage.
+	cab, err := s.bookingRepo.FindAvailableCabNear(ctx, req.Origin, 10000, req.SeatsNeeded, req.LuggageCount)
 	if err != nil {
 		return nil, ErrNoCabNearby
 	}

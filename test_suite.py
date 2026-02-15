@@ -50,9 +50,9 @@ P95_THRESHOLD_MS = 300     # Maximum acceptable P95 latency
 
 # ─── Helpers ─────────────────────────────────────────────────
 
-PASS = "\033[92m✔ PASS\033[0m"
-FAIL = "\033[91m✘ FAIL\033[0m"
-WARN = "\033[93m⚠ WARN\033[0m"
+PASS = "\033[92m[PASS]\033[0m"
+FAIL = "\033[91m[FAIL]\033[0m"
+WARN = "\033[93m[WARN]\033[0m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
@@ -120,16 +120,23 @@ def header(title: str):
 def preflight():
     """Verify the system is reachable."""
     header("PRE-FLIGHT CHECK")
-    try:
-        r = requests.get(f"{BASE_URL}/health", timeout=5)
-        data = r.json()
-        assert_test("Server reachable", r.status_code == 200)
-        assert_test("PostgreSQL healthy", data["services"]["postgres"] == "healthy")
-        assert_test("Redis healthy", data["services"]["redis"] == "healthy")
-    except requests.ConnectionError:
-        print(f"  {FAIL}  Cannot connect to {BASE_URL}")
-        print(f"        Is the system running? Try: docker-compose up --build -d")
-        sys.exit(1)
+    max_retries = 6
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(f"{BASE_URL}/health", timeout=5)
+            data = r.json()
+            assert_test("Server reachable", r.status_code == 200)
+            assert_test("PostgreSQL healthy", data["services"]["postgres"] == "healthy")
+            assert_test("Redis healthy", data["services"]["redis"] == "healthy")
+            return
+        except (requests.ConnectionError, requests.ReadTimeout) as e:
+            if attempt < max_retries - 1:
+                print(f"  Waiting for server... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(3)
+            else:
+                print(f"  {FAIL}  Cannot connect to {BASE_URL}")
+                print(f"        Is the system running? Try: docker-compose up --build -d")
+                sys.exit(1)
 
 
 # ─── Test 1: Functional Sanity Check ────────────────────────
@@ -193,6 +200,131 @@ def test_functional_sanity():
         status == "matched",
         f"Got: '{status}'" if status != "matched" else "",
     )
+
+
+# ─── Test 1b: Match API ────────────────────────────────────
+
+def test_match():
+    header("TEST 1b: MATCH API")
+    print("  Setup: Alice matched to trip; Bob pending nearby...\n")
+
+    seed_sql("""
+        TRUNCATE ride_requests, trips, cabs, users RESTART IDENTITY CASCADE;
+
+        INSERT INTO users (name, email, phone, role) VALUES
+          ('Alice', 'alice@test.com', '+911111111111', 'passenger'),
+          ('Bob',   'bob@test.com',   '+912222222222', 'passenger'),
+          ('Dave',  'dave@test.com',  '+913333333333', 'driver');
+
+        INSERT INTO cabs (driver_id, license_plate, seat_capacity, luggage_capacity,
+                          current_location, status) VALUES
+          (3, 'DL-01-AB', 4, 3, ST_SetSRID(ST_MakePoint(77.1000, 28.6800), 4326), 'available');
+
+        INSERT INTO trips (cab_id, direction, total_fare_cents, passenger_count, status) VALUES
+          (1, 'to_airport', 0, 1, 'planned');
+
+        INSERT INTO ride_requests (user_id, origin, destination, direction,
+                                   seats_needed, luggage_count, tolerance_meters, status, trip_id) VALUES
+          (1, ST_SetSRID(ST_MakePoint(77.1025, 28.7041), 4326), ST_SetSRID(ST_MakePoint(77.0889, 28.5562), 4326),
+           'to_airport', 1, 1, 5000, 'matched', 1),
+          (2, ST_SetSRID(ST_MakePoint(77.1010, 28.7020), 4326), ST_SetSRID(ST_MakePoint(77.0889, 28.5562), 4326),
+           'to_airport', 1, 1, 5000, 'pending', NULL);
+    """)
+
+    # Bob (id=2) should match trip 1
+    r = requests.post(f"{BASE_URL}/api/v1/match/2", timeout=10)
+    data = r.json() if r.status_code == 200 else {}
+
+    assert_test("POST /api/v1/match/2 returns 200", r.status_code == 200, r.text[:80] if r.status_code != 200 else "")
+    assert_test("Response contains trip_id", "trip_id" in data)
+    assert_test("Response contains cab_id", "cab_id" in data)
+
+    # Charlie far away (Noida) - expect 404 no_match
+    seed_sql("""
+        INSERT INTO users (name, email, phone, role) VALUES
+          ('Charlie', 'charlie@test.com', '+914444444444', 'passenger');
+        INSERT INTO ride_requests (user_id, origin, destination, direction,
+                                   seats_needed, luggage_count, tolerance_meters, status)
+        VALUES (4, ST_SetSRID(ST_MakePoint(77.3910, 28.5355), 4326), ST_SetSRID(ST_MakePoint(77.0889, 28.5562), 4326),
+                'to_airport', 1, 1, 2000, 'pending');
+    """)
+    charlie_id = run_sql("SELECT id FROM ride_requests WHERE user_id=4;")
+    if not charlie_id:
+        charlie_id = "3"
+    r2 = requests.post(f"{BASE_URL}/api/v1/match/{charlie_id}", timeout=10)
+    data2 = r2.json() if r2.status_code in (404, 200) else {}
+    # Far request: expect 404 no_match (or 200 if by chance a trip exists)
+    no_match_ok = r2.status_code == 404 and data2.get("error") == "no_match"
+    assert_test("Far request returns 404 no_match", no_match_ok,
+                f"Got {r2.status_code}: {data2}" if not no_match_ok else "")
+
+
+# ─── Test 1c: Cancel API ───────────────────────────────────
+
+def test_cancel():
+    header("TEST 1c: CANCEL API")
+    print("  Setup: Pending and matched requests...\n")
+
+    seed_sql("""
+        TRUNCATE ride_requests, trips, cabs, users RESTART IDENTITY CASCADE;
+
+        INSERT INTO users (name, email, phone, role) VALUES
+          ('Alice', 'alice@test.com', '+911111111111', 'passenger'),
+          ('Bob',   'bob@test.com',   '+912222222222', 'passenger'),
+          ('Dave',  'dave@test.com',  '+913333333333', 'driver');
+
+        INSERT INTO cabs (driver_id, license_plate, seat_capacity, luggage_capacity,
+                          current_location, status) VALUES
+          (3, 'DL-01-AB', 4, 3, ST_SetSRID(ST_MakePoint(77.1000, 28.6800), 4326), 'available');
+
+        INSERT INTO trips (cab_id, direction, total_fare_cents, passenger_count, status) VALUES
+          (1, 'to_airport', 0, 1, 'planned');
+
+        INSERT INTO ride_requests (user_id, origin, destination, direction,
+                                   seats_needed, luggage_count, tolerance_meters, status, trip_id) VALUES
+          (1, ST_SetSRID(ST_MakePoint(77.1025, 28.7041), 4326), ST_SetSRID(ST_MakePoint(77.0889, 28.5562), 4326),
+           'to_airport', 1, 1, 5000, 'matched', 1),
+          (2, ST_SetSRID(ST_MakePoint(77.1010, 28.7020), 4326), ST_SetSRID(ST_MakePoint(77.0889, 28.5562), 4326),
+           'to_airport', 1, 1, 5000, 'pending', NULL);
+    """)
+
+    # Cancel pending (id=2)
+    r = requests.post(f"{BASE_URL}/api/v1/cancel/2", timeout=10)
+    data = r.json() if r.status_code == 200 else {}
+    assert_test("Cancel pending returns 200", r.status_code == 200,
+                f"Got {r.status_code}: {r.text[:100]}" if r.status_code != 200 else "")
+    assert_test("Response contains request_id", data.get("request_id") == 2)
+
+    status2 = run_sql("SELECT status FROM ride_requests WHERE id = 2;")
+    assert_test("DB: request 2 is cancelled", status2 == "cancelled", f"Got status: {status2}")
+
+    # Cancel matched (id=1) - frees capacity
+    r2 = requests.post(f"{BASE_URL}/api/v1/cancel/1", timeout=10)
+    data2 = r2.json() if r2.status_code == 200 else {}
+    assert_test("Cancel matched returns 200", r2.status_code == 200,
+                f"Got {r2.status_code}: {r2.text[:100]}" if r2.status_code != 200 else "")
+    assert_test("Response has previous_trip_id", "previous_trip_id" in data2)
+    assert_test("Response has trip_cancelled", data2.get("trip_cancelled") is True)
+
+
+# ─── Test 1d: Fare Estimate API ─────────────────────────────
+
+def test_fare_estimate():
+    header("TEST 1d: FARE ESTIMATE API")
+    print("  Connaught Place -> IGI Airport...\n")
+
+    r = requests.post(
+        f"{BASE_URL}/api/v1/fare/estimate",
+        json={"origin_lat": 28.7041, "origin_lon": 77.1025, "dest_lat": 28.5562, "dest_lon": 77.0889},
+        timeout=10,
+    )
+    data = r.json() if r.status_code == 200 else {}
+
+    assert_test("POST /api/v1/fare/estimate returns 200", r.status_code == 200)
+    assert_test("Response has total_fare_cents", "total_fare_cents" in data)
+    assert_test("Response has surge_multiplier", "surge_multiplier" in data)
+    assert_test("Response has distance_km", "distance_km" in data)
+    assert_test("total_fare_cents > 0", data.get("total_fare_cents", 0) > 0)
 
 
 # ─── Test 2: Race Condition (Concurrency Safety) ────────────
@@ -290,7 +422,7 @@ def test_race_condition():
 
     if successes:
         winner = successes[0]
-        print(f"    Winner: request #{winner[0]} → {json.dumps(winner[1])}")
+        print(f"    Winner: request #{winner[0]} -> {json.dumps(winner[1])}")
 
     # ASSERTIONS
     assert_test(
@@ -324,7 +456,7 @@ def test_race_condition():
 
     # Final verdict
     if len(successes) == 1:
-        print(f"\n  {PASS}  {BOLD}TEST PASSED: Concurrency Safe ✓{RESET}")
+        print(f"\n  {PASS}  {BOLD}TEST PASSED: Concurrency Safe{RESET}")
     else:
         print(f"\n  {FAIL}  {BOLD}TEST FAILED: Double Booking Detected!{RESET}")
         print(f"        FIX: Check the FOR UPDATE clause in booking_repository.go")
@@ -397,17 +529,17 @@ def test_latency():
     effective_rps = LATENCY_REQUESTS / total_time * 50  # approx (50 workers)
 
     # Print metrics
-    print(f"  ┌──────────────────────────────────┐")
-    print(f"  │  Latency Results                 │")
-    print(f"  ├──────────────────────────────────┤")
-    print(f"  │  Total Requests:    {LATENCY_REQUESTS:>10}    │")
-    print(f"  │  Min Latency:       {min_lat:>8.1f} ms  │")
-    print(f"  │  Avg Latency:       {avg:>8.1f} ms  │")
-    print(f"  │  P50 (Median):      {p50:>8.1f} ms  │")
-    print(f"  │  {BOLD}P95 Latency:       {p95:>8.1f} ms{RESET}  │")
-    print(f"  │  P99 Latency:       {p99:>8.1f} ms  │")
-    print(f"  │  Max Latency:       {max_lat:>8.1f} ms  │")
-    print(f"  └──────────────────────────────────┘\n")
+    print(f"  +----------------------------------+")
+    print(f"  |  Latency Results                 |")
+    print(f"  +----------------------------------+")
+    print(f"  |  Total Requests:    {LATENCY_REQUESTS:>10}    |")
+    print(f"  |  Min Latency:       {min_lat:>8.1f} ms  |")
+    print(f"  |  Avg Latency:       {avg:>8.1f} ms  |")
+    print(f"  |  P50 (Median):      {p50:>8.1f} ms  |")
+    print(f"  |  {BOLD}P95 Latency:       {p95:>8.1f} ms{RESET}  |")
+    print(f"  |  P99 Latency:       {p99:>8.1f} ms  |")
+    print(f"  |  Max Latency:       {max_lat:>8.1f} ms  |")
+    print(f"  +----------------------------------+\n")
 
     # Assertions
     assert_test(
@@ -435,16 +567,19 @@ def test_latency():
 
 def main():
     print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║   Smart Airport Ride Pooling — QA Verification Suite        ║
-║   Target: {BASE_URL:<49s}║
-╚══════════════════════════════════════════════════════════════╝
+================================================================
+   Smart Airport Ride Pooling - QA Verification Suite
+   Target: {BASE_URL}
+================================================================
     """)
 
     start = time.time()
 
     preflight()
     test_functional_sanity()
+    test_match()
+    test_cancel()
+    test_fare_estimate()
     test_race_condition()
     test_latency()
 
@@ -459,9 +594,9 @@ def main():
     print(f"  Time:     {elapsed:.1f}s\n")
 
     if results["failed"] == 0:
-        print(f"  {BOLD}🎉 ALL TESTS PASSED{RESET}\n")
+        print(f"  {BOLD}ALL TESTS PASSED{RESET}\n")
     else:
-        print(f"  {BOLD}❌ {results['failed']} TEST(S) FAILED{RESET}\n")
+        print(f"  {BOLD}{results['failed']} TEST(S) FAILED{RESET}\n")
         sys.exit(1)
 
 

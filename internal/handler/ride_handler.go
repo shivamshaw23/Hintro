@@ -78,6 +78,15 @@ func (h *RideHandler) CreateRide(w http.ResponseWriter, r *http.Request) {
 	if body.SeatsNeeded <= 0 {
 		body.SeatsNeeded = 1
 	}
+	if body.LuggageCount < 0 {
+		body.LuggageCount = 0
+	}
+	if body.LuggageCount > model.MaxLuggagePerRequest {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "luggage_count must be between 0 and 8",
+		})
+		return
+	}
 	if body.ToleranceMeters <= 0 {
 		body.ToleranceMeters = 2000 // Default 2km
 	}

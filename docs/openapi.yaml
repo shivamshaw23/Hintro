@@ -1,0 +1,348 @@
+openapi: 3.0.3
+info:
+  title: Smart Airport Ride Pooling API
+  description: |
+    High-performance ride pooling backend that groups airport-bound passengers into shared cabs,
+    minimizing travel deviation while respecting seat/luggage constraints.
+
+    **Targets:** <300ms latency · 100 RPS · 10,000 concurrent users
+  version: 1.0.0
+  contact:
+    name: Hintro API
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Health
+    description: Service health checks
+  - name: Matching
+    description: Find compatible trips
+  - name: Booking
+    description: Book rides and cancellations
+  - name: Pricing
+    description: Fare estimates with surge
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns health status of the API and dependencies (PostgreSQL, Redis).
+      operationId: getHealth
+      responses:
+        '200':
+          description: All services healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: One or more services degraded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/v1/match/{request_id}:
+    post:
+      tags: [Matching]
+      summary: Find compatible trip
+      description: |
+        Finds an existing trip compatible with the given ride request.
+        Returns match details if found, or 404 if a new trip should be created.
+      operationId: matchRideRequest
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            example: 2
+      responses:
+        '200':
+          description: Match found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchResult'
+        '400':
+          description: Invalid request_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Request not found or no compatible trip
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                no_match:
+                  value:
+                    error: no_match
+                    message: "No compatible trip found. A new trip should be created."
+                not_found:
+                  value:
+                    error: not_found
+                    message: "Ride request not found."
+        '409':
+          description: Request already matched
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: already_matched
+                message: "This ride request is already matched to a trip."
+
+  /api/v1/book/{request_id}:
+    post:
+      tags: [Booking]
+      summary: Book a ride
+      description: |
+        Books a ride for the given request. Finds a compatible trip (or creates a new one)
+        and reserves the seat atomically with pessimistic locking.
+      operationId: bookRide
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            example: 2
+      responses:
+        '200':
+          description: Booking successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingResult'
+        '400':
+          description: Invalid request_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Request not found or no cab nearby
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '408':
+          description: Booking timed out (lock contention)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Request not in pending state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Cab full or unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/cancel/{request_id}:
+    post:
+      tags: [Booking]
+      summary: Cancel a ride request
+      description: |
+        Cancels a ride request (real-time cancellations).
+        Only PENDING and MATCHED requests can be cancelled.
+      operationId: cancelRide
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            example: 2
+      responses:
+        '200':
+          description: Cancellation successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResult'
+        '400':
+          description: Invalid request_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Ride request not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Already cancelled or non-cancellable state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/fare/estimate:
+    post:
+      tags: [Pricing]
+      summary: Estimate fare
+      description: |
+        Calculates fare with dynamic surge pricing based on demand/supply in the area.
+        Formula: (BaseFare + Distance×PerKm + Time×PerMin) × SurgeMultiplier
+      operationId: estimateFare
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FareEstimateRequest'
+      responses:
+        '200':
+          description: Fare estimate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FareEstimate'
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        services:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            postgres: healthy
+            redis: healthy
+
+    MatchResult:
+      type: object
+      required: [trip_id, cab_id]
+      properties:
+        trip_id:
+          type: integer
+          format: int64
+        cab_id:
+          type: integer
+          format: int64
+        added_detour_minutes:
+          type: number
+          format: double
+
+    BookingResult:
+      type: object
+      required: [trip_id, cab_id, request_id]
+      properties:
+        trip_id:
+          type: integer
+          format: int64
+        cab_id:
+          type: integer
+          format: int64
+        request_id:
+          type: integer
+          format: int64
+        seats_booked:
+          type: integer
+        remaining_seats:
+          type: integer
+        luggage_booked:
+          type: integer
+        remaining_luggage:
+          type: integer
+
+    CancelResult:
+      type: object
+      required: [request_id]
+      properties:
+        request_id:
+          type: integer
+          format: int64
+        previous_trip_id:
+          type: integer
+          format: int64
+        trip_cancelled:
+          type: boolean
+        cab_freed:
+          type: boolean
+
+    FareEstimateRequest:
+      type: object
+      required: [origin_lat, origin_lon, dest_lat, dest_lon]
+      properties:
+        origin_lat:
+          type: number
+          format: double
+          example: 28.7041
+        origin_lon:
+          type: number
+          format: double
+          example: 77.1025
+        dest_lat:
+          type: number
+          format: double
+          example: 28.5562
+        dest_lon:
+          type: number
+          format: double
+          example: 77.0889
+
+    FareEstimate:
+      type: object
+      properties:
+        base_fare_cents:
+          type: integer
+        distance_fare_cents:
+          type: integer
+        time_fare_cents:
+          type: integer
+        subtotal_cents:
+          type: integer
+        surge_multiplier:
+          type: number
+        total_fare_cents:
+          type: integer
+        distance_km:
+          type: number
+        estimated_minutes:
+          type: number
+        demand:
+          type: integer
+        supply:
+          type: integer
+        demand_supply_ratio:
+          type: number
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string

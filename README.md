@@ -74,10 +74,29 @@ Hintro/
 ├── migrations/
 │   ├── 001_create_schema.up.sql    # Full schema (PostGIS, indexes, triggers)
 │   └── 001_create_schema.down.sql  # Rollback script
+├── docs/
+│   ├── HIGH_LEVEL_ARCHITECTURE.md  # HLD: system diagram, deployment
+│   ├── LOW_LEVEL_DESIGN.md         # LLD: class diagram, patterns
+│   ├── ASSIGNMENT_VERIFICATION.md  # Requirement checklist
+│   ├── openapi.yaml                # OpenAPI 3.0 spec
+│   └── Hintro.postman_collection.json
 ├── Dockerfile                      # Multi-stage build (builder → alpine)
 ├── docker-compose.yml              # One-command orchestration
 └── entrypoint.sh                   # Auto-migration on startup
 ```
+
+---
+
+## 📋 Documentation
+
+| Artifact | Location | Usage |
+|----------|----------|-------|
+| **High-Level Architecture** | [`docs/HIGH_LEVEL_ARCHITECTURE.md`](docs/HIGH_LEVEL_ARCHITECTURE.md) | System diagram, components, scaling |
+| **Low-Level Design** | [`docs/LOW_LEVEL_DESIGN.md`](docs/LOW_LEVEL_DESIGN.md) | Class diagram, patterns, data flow |
+| **OpenAPI 3.0** | [`docs/openapi.yaml`](docs/openapi.yaml) | Import into Swagger Editor, Swagger UI, or code generators |
+| **Postman** | [`docs/Hintro.postman_collection.json`](docs/Hintro.postman_collection.json) | Import into Postman via File → Import |
+
+**View OpenAPI in Swagger UI:** Open [editor.swagger.io](https://editor.swagger.io) and paste the contents of `docs/openapi.yaml`, or use `File → Import file`.
 
 ---
 
@@ -153,9 +172,13 @@ curl -X POST http://localhost:8080/api/v1/book/2
   "cab_id": 1,
   "request_id": 2,
   "seats_booked": 1,
-  "remaining_seats": 2
+  "remaining_seats": 2,
+  "luggage_booked": 1,
+  "remaining_luggage": 2
 }
 ```
+
+**Luggage constraints:** Both seats and luggage are enforced. A request with 3 bags will only match/book cabs with ≥3 luggage capacity. `luggage_count` (0–8 per request) and `luggage_capacity` (0–10 per cab) are validated at creation and enforced in matching/booking.
 
 | Status | Meaning |
 |--------|---------|
@@ -165,6 +188,44 @@ curl -X POST http://localhost:8080/api/v1/book/2
 | `408` | Timeout (lock contention) |
 | `409` | Request not in `pending` state |
 | `422` | Cab full / cab unavailable |
+
+---
+
+### `POST /api/v1/cancel/{request_id}`
+
+Cancel a ride request (real-time cancellations).
+
+```bash
+curl -X POST http://localhost:8080/api/v1/cancel/2
+```
+
+**Response** `200 OK` — PENDING request cancelled:
+```json
+{
+  "request_id": 2
+}
+```
+
+**Response** `200 OK` — MATCHED request cancelled (freed capacity):
+```json
+{
+  "request_id": 2,
+  "previous_trip_id": 1,
+  "trip_cancelled": true,
+  "cab_freed": true
+}
+```
+
+**State transitions:**
+- **PENDING** → CANCELLED: Request removed from matching pool. No trip/cab impact.
+- **MATCHED** → CANCELLED: Trip passenger count decremented; trip cleared if last passenger; cab set back to available.
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Cancellation successful |
+| `400` | Invalid `request_id` |
+| `404` | Ride request not found |
+| `409` | Already cancelled or in non-cancellable state (confirmed/completed) |
 
 ---
 
@@ -213,6 +274,25 @@ Price = (BaseFare + Distance × PerKmRate + Time × PerMinRate) × SurgeMultipli
 | R ≤ 1.5 | 1.0× (normal) |
 | R > 1.5 | 1.2× (moderate) |
 | R > 2.0 | 1.5× (high) |
+
+---
+
+## ⚙️ Tech Stack & Assumptions
+
+| Component   | Choice                     | Assumption |
+|------------|----------------------------|------------|
+| Language   | Go 1.22                    | Single binary, good concurrency |
+| Database   | PostgreSQL 16 + PostGIS 3.4| Spatial indexing for proximity |
+| Cache      | Redis 7                    | Surge pricing demand/supply cache |
+| Container  | Docker + Compose           | Local dev and deployment |
+| Router     | Gorilla Mux                | Simple HTTP routing |
+
+**Assumptions:**
+- Passengers go to/from a single airport; direction is `to_airport` or `from_airport`
+- Haversine for distance/time (no OSRM/Maps API); 30 km/h average speed
+- Greedy matching suffices (no optimal TSP); 4–6 passengers per trip
+- Pessimistic locking preferred over optimistic for booking correctness
+- Surge cache 30s TTL acceptable; graceful fallback to PostGIS if Redis down
 
 ---
 
@@ -322,9 +402,30 @@ curl -X POST http://localhost:8080/api/v1/book/2
 curl -X POST http://localhost:8080/api/v1/fare/estimate \
   -H "Content-Type: application/json" \
   -d '{"origin_lat":28.7041,"origin_lon":77.1025,"dest_lat":28.5562,"dest_lon":77.0889}'
+
+# Test cancellation (request 2 must exist and be pending or matched)
+curl -X POST http://localhost:8080/api/v1/cancel/2
 ```
 
 Concurrency race test seed: `migrations/test_concurrency_seed.sql`
+
+### Run All Tests
+
+```bash
+# 1. Go unit tests (no server needed)
+go test ./...
+
+# 2. Ensure the system is running (use --build after code changes)
+docker-compose up --build -d
+
+# 3. Run integration tests (functional, match, cancel, fare, race, latency)
+pip install requests   # if not installed
+python test_suite.py
+```
+
+**Test coverage:**
+- `go test ./...` — geo (Haversine, route, insertion), model
+- `python test_suite.py` — health, book, match, cancel, fare, race condition, P95 latency
 
 ---
 

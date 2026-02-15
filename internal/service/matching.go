@@ -109,6 +109,16 @@ func (s *MatchingService) MatchRiders(ctx context.Context, requestID int64) (*mo
 	for i := range candidates {
 		ct := &candidates[i]
 
+		// --- Load route for detour calculation (origins + destination) ---
+		stops, err := s.Repo.GetTripStops(ctx, ct.TripID)
+		if err != nil {
+			log.Printf("[match]   Trip #%d: SKIP failed to get stops: %v", ct.TripID, err)
+			continue
+		}
+		if len(stops) > 0 {
+			ct.Route = append(stops, req.Destination)
+		}
+
 		// --- Hard Constraint: Seat capacity ---
 		if ct.CurrentLoad+req.SeatsNeeded > ct.SeatCapacity {
 			log.Printf("[match]   Trip #%d: SKIP seats (%d+%d > %d)",

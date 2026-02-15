@@ -54,10 +54,12 @@ func main() {
 
 	matchingSvc := service.NewMatchingService(rideRepo)
 	bookingSvc := service.NewBookingService(bookingRepo, matchingSvc)
+	cancelSvc := service.NewCancelService(bookingRepo, pricingRepo)
 	pricingSvc := service.NewPricingService(pricingRepo, service.DefaultFareConfig())
 
 	matchHandler := handler.NewMatchHandler(matchingSvc)
 	bookingHandler := handler.NewBookingHandler(bookingSvc)
+	cancelHandler := handler.NewCancelHandler(cancelSvc)
 	pricingHandler := handler.NewPricingHandler(pricingSvc)
 
 	// ── Setup router ────────────────────────────────────
@@ -70,6 +72,7 @@ func main() {
 	api := router.PathPrefix("/api/v1").Subrouter()
 	api.HandleFunc("/match/{request_id}", matchHandler.MatchRideRequest).Methods(http.MethodPost)
 	api.HandleFunc("/book/{request_id}", bookingHandler.BookRide).Methods(http.MethodPost)
+	api.HandleFunc("/cancel/{request_id}", cancelHandler.CancelRide).Methods(http.MethodPost)
 	api.HandleFunc("/fare/estimate", pricingHandler.EstimateFare).Methods(http.MethodPost)
 
 	// ── Start HTTP server ───────────────────────────────

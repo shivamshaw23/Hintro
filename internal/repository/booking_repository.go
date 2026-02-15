@@ -27,11 +27,13 @@ func NewBookingRepository(pool *pgxpool.Pool) *BookingRepository {
 
 // BookingResult contains the outcome of a successful booking transaction.
 type BookingResult struct {
-	TripID         int64  `json:"trip_id"`
-	CabID          int64  `json:"cab_id"`
-	RequestID      int64  `json:"request_id"`
-	SeatsBooked    int    `json:"seats_booked"`
-	RemainingSeats int    `json:"remaining_seats"`
+	TripID            int64  `json:"trip_id"`
+	CabID             int64  `json:"cab_id"`
+	RequestID         int64  `json:"request_id"`
+	SeatsBooked       int    `json:"seats_booked"`
+	RemainingSeats    int    `json:"remaining_seats"`
+	LuggageBooked     int    `json:"luggage_booked"`
+	RemainingLuggage  int    `json:"remaining_luggage"`
 }
 
 // ─── The Core Transactional Booking ─────────────────────────
@@ -187,11 +189,13 @@ func (r *BookingRepository) BookRide(
 	}
 
 	return &BookingResult{
-		TripID:         tripID,
-		CabID:          cabID,
-		RequestID:      requestID,
-		SeatsBooked:    reqSeats,
-		RemainingSeats: remainingSeats - reqSeats,
+		TripID:           tripID,
+		CabID:            cabID,
+		RequestID:        requestID,
+		SeatsBooked:      reqSeats,
+		RemainingSeats:   remainingSeats - reqSeats,
+		LuggageBooked:    reqLuggage,
+		RemainingLuggage: remainingLuggage - reqLuggage,
 	}, nil
 }
 
@@ -245,12 +249,16 @@ func (r *BookingRepository) CreateTrip(
 
 // ─── Helper: Find an available cab near a location ──────────
 
-// FindAvailableCabNear returns the closest available cab within radiusMeters.
+// FindAvailableCabNear returns the closest available cab within radiusMeters
+// that has at least minSeatsNeeded and minLuggageNeeded capacity.
+// Used when creating a new trip — ensures the cab can fit the requesting passenger.
 // Uses GIST index on cabs(current_location) for spatial lookup.
 func (r *BookingRepository) FindAvailableCabNear(
 	ctx context.Context,
 	location model.Location,
 	radiusMeters int,
+	minSeatsNeeded int,
+	minLuggageNeeded int,
 ) (*model.Cab, error) {
 
 	query := `
@@ -260,6 +268,8 @@ func (r *BookingRepository) FindAvailableCabNear(
 		FROM cabs
 		WHERE status = 'available'
 		  AND current_location IS NOT NULL
+		  AND seat_capacity >= $4
+		  AND luggage_capacity >= $5
 		  AND ST_DWithin(
 		        current_location::geography,
 		        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
@@ -275,7 +285,7 @@ func (r *BookingRepository) FindAvailableCabNear(
 	cab := &model.Cab{}
 	var loc model.Location
 
-	err := r.pool.QueryRow(ctx, query, location.Lon, location.Lat, radiusMeters).Scan(
+	err := r.pool.QueryRow(ctx, query, location.Lon, location.Lat, radiusMeters, minSeatsNeeded, minLuggageNeeded).Scan(
 		&cab.ID, &cab.DriverID, &cab.LicensePlate,
 		&cab.SeatCapacity, &cab.LuggageCapacity,
 		&loc.Lat, &loc.Lon,
@@ -287,6 +297,167 @@ func (r *BookingRepository) FindAvailableCabNear(
 
 	cab.CurrentLocation = &loc
 	return cab, nil
+}
+
+// ─── Cancel Ride ─────────────────────────────────────────────
+
+// CancelResult contains the outcome of a successful cancellation.
+type CancelResult struct {
+	RequestID      int64   `json:"request_id"`
+	PreviousTrip   *int64  `json:"previous_trip_id,omitempty"`
+	TripCancelled  bool    `json:"trip_cancelled,omitempty"` // True if the whole trip was cancelled (last passenger).
+	CabFreed       bool    `json:"cab_freed,omitempty"`      // True if cab was set back to available.
+	OriginLat      float64 `json:"-"`                         // For surge cache invalidation (not in JSON response).
+	OriginLon      float64 `json:"-"`
+}
+
+// CancelRide cancels a ride request. Uses pessimistic locking for concurrency safety.
+//
+// State transitions:
+//   - PENDING  → CANCELLED: Simple status update. No trip/cab impact.
+//   - MATCHED  → CANCELLED: Decrement trip passenger_count, clear trip_id. If trip has
+//                 0 passengers left, cancel the trip and set cab back to available.
+//   - CONFIRMED, COMPLETED, CANCELLED: Not cancellable (terminal states).
+//
+// Concurrency: Same as BookRide — SELECT ... FOR UPDATE on request and cab/trip.
+func (r *BookingRepository) CancelRide(
+	ctx context.Context,
+	requestID int64,
+) (*CancelResult, error) {
+
+	txCtx, cancel := context.WithTimeout(ctx, DefaultBookingTimeout)
+	defer cancel()
+
+	tx, err := r.pool.BeginTx(txCtx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("cancel: begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// ── Step 1: LOCK the ride request ────────────────────
+	var (
+		reqStatus model.RequestStatus
+		reqTripID *int64
+		reqSeats  int
+		reqLuggage int
+		originLon float64
+		originLat float64
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT status, trip_id, seats_needed, luggage_count,
+		       ST_X(origin) AS origin_lon, ST_Y(origin) AS origin_lat
+		FROM ride_requests
+		WHERE id = $1
+		FOR UPDATE
+	`, requestID).Scan(&reqStatus, &reqTripID, &reqSeats, &reqLuggage, &originLon, &originLat)
+	if err != nil {
+		return nil, fmt.Errorf("cancel: lock request %d: %w", requestID, err)
+	}
+
+	// ── Step 2: Validate — only PENDING or MATCHED can be cancelled ─
+	switch reqStatus {
+	case model.RequestCancelled:
+		return nil, fmt.Errorf("cancel: request %d is already cancelled", requestID)
+	case model.RequestCompleted:
+		return nil, fmt.Errorf("cancel: request %d is completed, cannot cancel", requestID)
+	case model.RequestConfirmed:
+		return nil, fmt.Errorf("cancel: request %d is confirmed, cannot cancel", requestID)
+	case model.RequestPending, model.RequestMatched:
+		// OK to cancel
+	default:
+		return nil, fmt.Errorf("cancel: request %d has unknown status '%s'", requestID, reqStatus)
+	}
+
+	result := &CancelResult{
+		RequestID: requestID,
+		OriginLat: originLat,
+		OriginLon: originLon,
+	}
+
+	// ── Step 3a: PENDING — simple status update ───────────
+	if reqStatus == model.RequestPending {
+		_, err = tx.Exec(ctx, `
+			UPDATE ride_requests
+			SET status = 'cancelled', trip_id = NULL
+			WHERE id = $1
+		`, requestID)
+		if err != nil {
+			return nil, fmt.Errorf("cancel: update request %d: %w", requestID, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("cancel: commit: %w", err)
+		}
+		return result, nil
+	}
+
+	// ── Step 3b: MATCHED — update request, decrement trip, possibly cancel trip/cab ─
+	tripID := *reqTripID
+
+	// Update request: set cancelled, clear trip_id.
+	_, err = tx.Exec(ctx, `
+		UPDATE ride_requests
+		SET status = 'cancelled', trip_id = NULL
+		WHERE id = $1
+	`, requestID)
+	if err != nil {
+		return nil, fmt.Errorf("cancel: update request %d: %w", requestID, err)
+	}
+
+	result.PreviousTrip = &tripID
+
+	// Decrement trip passenger count.
+	_, err = tx.Exec(ctx, `
+		UPDATE trips
+		SET passenger_count = GREATEST(0, passenger_count - $2)
+		WHERE id = $1
+	`, tripID, reqSeats)
+	if err != nil {
+		return nil, fmt.Errorf("cancel: update trip %d: %w", tripID, err)
+	}
+
+	// Count remaining matched passengers on this trip.
+	var remainingPassengers int
+	err = tx.QueryRow(ctx, `
+		SELECT COUNT(*)::int
+		FROM ride_requests
+		WHERE trip_id = $1 AND status = 'matched'
+	`, tripID).Scan(&remainingPassengers)
+	if err != nil {
+		return nil, fmt.Errorf("cancel: count remaining passengers: %w", err)
+	}
+
+	// If no passengers left, cancel the trip and free the cab.
+	if remainingPassengers == 0 {
+		_, err = tx.Exec(ctx, `
+			UPDATE trips SET status = 'cancelled' WHERE id = $1
+		`, tripID)
+		if err != nil {
+			return nil, fmt.Errorf("cancel: cancel trip %d: %w", tripID, err)
+		}
+		result.TripCancelled = true
+
+		// Get cab_id for this trip and set cab back to available.
+		var cabID int64
+		err = tx.QueryRow(ctx, `SELECT cab_id FROM trips WHERE id = $1`, tripID).Scan(&cabID)
+		if err != nil {
+			return nil, fmt.Errorf("cancel: get cab for trip %d: %w", tripID, err)
+		}
+
+		_, err = tx.Exec(ctx, `
+			UPDATE cabs
+			SET status = 'available'
+			WHERE id = $1 AND status = 'en_route'
+		`, cabID)
+		if err != nil {
+			return nil, fmt.Errorf("cancel: free cab %d: %w", cabID, err)
+		}
+		result.CabFreed = true
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("cancel: commit: %w", err)
+	}
+	return result, nil
 }
 
 // ─── Timeout helper ─────────────────────────────────────────

@@ -49,6 +49,15 @@ const (
 	DirectionFromAirport TripDirection = "from_airport"
 )
 
+// ─── Capacity Constraints (matches DB CHECK constraints) ───────
+
+const (
+	MinLuggagePerRequest = 0
+	MaxLuggagePerRequest = 8
+	MinLuggagePerCab     = 0
+	MaxLuggagePerCab     = 10
+)
+
 // ─── Location ───────────────────────────────────────────────
 
 // Location represents a WGS-84 geographic point (EPSG:4326).
@@ -71,12 +80,13 @@ type User struct {
 }
 
 // Cab maps to the `cabs` table.
+// LuggageCapacity is the number of luggage slots (0–10). Enforced in matching and booking.
 type Cab struct {
 	ID              int64     `json:"id"`
 	DriverID        int64     `json:"driver_id"`
 	LicensePlate    string    `json:"license_plate"`
 	SeatCapacity    int       `json:"seat_capacity"`
-	LuggageCapacity int       `json:"luggage_capacity"`
+	LuggageCapacity int       `json:"luggage_capacity"` // Slots available; CHECK (0–10)
 	CurrentLocation *Location `json:"current_location,omitempty"`
 	Status          CabStatus `json:"status"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -84,6 +94,7 @@ type Cab struct {
 }
 
 // RideRequest maps to the `ride_requests` table.
+// LuggageCount is the number of bags (0–8). Must fit within cab's LuggageCapacity.
 type RideRequest struct {
 	ID              int64         `json:"id"`
 	UserID          int64         `json:"user_id"`
@@ -91,7 +102,7 @@ type RideRequest struct {
 	Destination     Location      `json:"destination"`
 	Direction       TripDirection `json:"direction"`
 	SeatsNeeded     int           `json:"seats_needed"`
-	LuggageCount    int           `json:"luggage_count"`
+	LuggageCount    int           `json:"luggage_count"` // Bags; CHECK (0–8); enforced in matching/booking
 	ToleranceMeters int           `json:"tolerance_meters"`
 	Status          RequestStatus `json:"status"`
 	TripID          *int64        `json:"trip_id,omitempty"`

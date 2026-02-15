@@ -1,0 +1,101 @@
+{
+  "info": {
+    "name": "Hintro - Smart Airport Ride Pooling API",
+    "description": "API collection for the Smart Airport Ride Pooling Backend.\n\n**Setup:** Run `docker-compose up --build -d` then seed test data from `migrations/test_seed.sql`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health",
+            "description": "Returns health status of PostgreSQL and Redis."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Matching",
+      "item": [
+        {
+          "name": "Match Ride Request",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/match/2",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "match", "2"]
+            },
+            "description": "Find a compatible existing trip for ride request ID 2. Returns 404 if no match."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Booking",
+      "item": [
+        {
+          "name": "Book Ride",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/book/2",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "book", "2"]
+            },
+            "description": "Book a ride for request ID 2. Finds match or creates new trip."
+          }
+        },
+        {
+          "name": "Cancel Ride",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/cancel/2",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "cancel", "2"]
+            },
+            "description": "Cancel ride request ID 2. Only pending or matched can be cancelled."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Pricing",
+      "item": [
+        {
+          "name": "Estimate Fare",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"origin_lat\": 28.7041,\n  \"origin_lon\": 77.1025,\n  \"dest_lat\": 28.5562,\n  \"dest_lon\": 77.0889\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/fare/estimate",
+            "description": "Connaught Place (Delhi) → IGI Airport. Returns fare with surge pricing."
+          }
+        }
+      ]
+    }
+  ]
+}

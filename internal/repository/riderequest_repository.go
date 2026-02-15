@@ -21,10 +21,15 @@ func NewRideRequestRepository(pool *pgxpool.Pool) *RideRequestRepository {
 }
 
 // CreateRideRequest inserts a new pending ride request.
+// Enforces luggage constraints: LuggageCount must be in [0, 8] (matches DB CHECK).
 func (r *RideRequestRepository) CreateRideRequest(
 	ctx context.Context,
 	req *model.RideRequest,
 ) (*model.RideRequest, error) {
+	if req.LuggageCount < model.MinLuggagePerRequest || req.LuggageCount > model.MaxLuggagePerRequest {
+		return nil, fmt.Errorf("create ride request: luggage_count must be between %d and %d, got %d",
+			model.MinLuggagePerRequest, model.MaxLuggagePerRequest, req.LuggageCount)
+	}
 	query := `
 		INSERT INTO ride_requests (
 			user_id, origin, destination, direction,
