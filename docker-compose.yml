@@ -1,0 +1,76 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL + PostGIS ─────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: hintro-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hintro
+      POSTGRES_PASSWORD: hintro_secret
+      POSTGRES_DB: hintro_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U hintro -d hintro_db" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ── Redis ────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: hintro-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── Application ─────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hintro-app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Server
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "8080"
+      # PostgreSQL — uses Docker service name for DNS resolution.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: hintro
+      POSTGRES_PASSWORD: hintro_secret
+      POSTGRES_DB: hintro_db
+      POSTGRES_SSLMODE: disable
+      POSTGRES_MAX_CONNS: "50"
+      POSTGRES_MIN_CONNS: "10"
+      # Redis — uses Docker service name for DNS resolution.
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      REDIS_POOL_SIZE: "100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
