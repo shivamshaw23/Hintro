@@ -1,13 +1,17 @@
 {
   "info": {
     "name": "Hintro - Smart Airport Ride Pooling API",
-    "description": "API collection for the Smart Airport Ride Pooling Backend.\n\n**Setup:** Run `docker-compose up --build -d` then seed test data from `migrations/test_seed.sql`.",
+    "description": "API collection for the Smart Airport Ride Pooling Backend.\n\n**Setup:** Run `docker-compose up -d` then seed: Get-Content migrations\\test_seed.sql -Raw | docker exec -i hintro-postgres psql -U hintro -d hintro_db\n\n**Order:** Health → Estimate Fare → Match → Book → Cancel. See docs/POSTMAN_TESTING.md for full steps.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     {
       "key": "baseUrl",
       "value": "http://localhost:8080"
+    },
+    {
+      "key": "request_id",
+      "value": "2"
     }
   ],
   "item": [
@@ -26,6 +30,42 @@
       ]
     },
     {
+      "name": "Ride Requests",
+      "item": [
+        {
+          "name": "Create Ride Request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": 1,\n  \"origin_lat\": 28.7041,\n  \"origin_lon\": 77.1025,\n  \"dest_lat\": 28.5562,\n  \"dest_lon\": 77.0889,\n  \"direction\": \"to_airport\",\n  \"seats_needed\": 1,\n  \"luggage_count\": 1,\n  \"tolerance_meters\": 2000\n}"
+            },
+            "url": "{{baseUrl}}/api/v1/rides",
+            "description": "Create a new pending ride request. Returns the created request with ID. Use this ID for match/book/cancel."
+          }
+        },
+        {
+          "name": "Get Ride Request",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/rides/{{request_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "rides", "{{request_id}}"]
+            },
+            "description": "Get status of a ride request by ID."
+          }
+        }
+      ]
+    },
+    {
       "name": "Matching",
       "item": [
         {
@@ -34,9 +74,9 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/v1/match/2",
+              "raw": "{{baseUrl}}/api/v1/match/{{request_id}}",
               "host": ["{{baseUrl}}"],
-              "path": ["api", "v1", "match", "2"]
+              "path": ["api", "v1", "match", "{{request_id}}"]
             },
             "description": "Find a compatible existing trip for ride request ID 2. Returns 404 if no match."
           }
@@ -52,9 +92,9 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/v1/book/2",
+              "raw": "{{baseUrl}}/api/v1/book/{{request_id}}",
               "host": ["{{baseUrl}}"],
-              "path": ["api", "v1", "book", "2"]
+              "path": ["api", "v1", "book", "{{request_id}}"]
             },
             "description": "Book a ride for request ID 2. Finds match or creates new trip."
           }
@@ -65,9 +105,9 @@
             "method": "POST",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/v1/cancel/2",
+              "raw": "{{baseUrl}}/api/v1/cancel/{{request_id}}",
               "host": ["{{baseUrl}}"],
-              "path": ["api", "v1", "cancel", "2"]
+              "path": ["api", "v1", "cancel", "{{request_id}}"]
             },
             "description": "Cancel ride request ID 2. Only pending or matched can be cancelled."
           }

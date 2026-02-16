@@ -16,6 +16,7 @@ import (
 
 	"github.com/shiva/hintro/config"
 	"github.com/shiva/hintro/internal/handler"
+	"github.com/shiva/hintro/internal/middleware"
 	"github.com/shiva/hintro/internal/repository"
 	"github.com/shiva/hintro/internal/service"
 	"github.com/shiva/hintro/pkg/cache"
@@ -49,6 +50,7 @@ func main() {
 
 	// ── Initialize layers ───────────────────────────────
 	rideRepo := repository.NewRideRepository(pgPool)
+	rideRequestRepo := repository.NewRideRequestRepository(pgPool)
 	bookingRepo := repository.NewBookingRepository(pgPool)
 	pricingRepo := repository.NewPricingRepository(pgPool, redisClient)
 
@@ -61,6 +63,7 @@ func main() {
 	bookingHandler := handler.NewBookingHandler(bookingSvc)
 	cancelHandler := handler.NewCancelHandler(cancelSvc)
 	pricingHandler := handler.NewPricingHandler(pricingSvc)
+	rideHandler := handler.NewRideHandler(rideRequestRepo)
 
 	// ── Setup router ────────────────────────────────────
 	router := mux.NewRouter()
@@ -70,15 +73,22 @@ func main() {
 
 	// API v1 routes.
 	api := router.PathPrefix("/api/v1").Subrouter()
+	// Ride request CRUD
+	api.HandleFunc("/rides", rideHandler.CreateRide).Methods(http.MethodPost)
+	api.HandleFunc("/rides/{id}", rideHandler.GetRide).Methods(http.MethodGet)
+	// Matching, booking, cancellation
 	api.HandleFunc("/match/{request_id}", matchHandler.MatchRideRequest).Methods(http.MethodPost)
 	api.HandleFunc("/book/{request_id}", bookingHandler.BookRide).Methods(http.MethodPost)
 	api.HandleFunc("/cancel/{request_id}", cancelHandler.CancelRide).Methods(http.MethodPost)
 	api.HandleFunc("/fare/estimate", pricingHandler.EstimateFare).Methods(http.MethodPost)
 
+	// Wrap with CORS so Swagger UI (and other browser clients) can call the API.
+	handler := middleware.CORS(router)
+
 	// ── Start HTTP server ───────────────────────────────
 	srv := &http.Server{
 		Addr:         cfg.Server.ServerAddr(),
-		Handler:      router,
+		Handler:      handler,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 		IdleTimeout:  cfg.Server.IdleTimeout,
